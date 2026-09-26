@@ -54,6 +54,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK: Bot is alive and running!")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+
     def log_message(self, format, *args):
         # Отключаем спам в логах от частых запросов UptimeRobot
         pass
