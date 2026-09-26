@@ -12,6 +12,7 @@ Telegram-бот: в выбранных темах (топиках) форума 
   - Должен быть администратором с правом "Удаление сообщений".
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -54,7 +55,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK: Bot is alive and running!")
 
     def log_message(self, format, *args):
-        # Отключаем спам в логах от частых пингов UptimeRobot
+        # Отключаем спам в логах от частых запросов UptimeRobot
         pass
 
 
@@ -189,6 +190,10 @@ def main():
             "Укажите токен бота: задайте переменную окружения BOT_TOKEN "
             "или впишите его в код."
         )
+
+    # Принудительно создаем и регистрируем event loop для главного потока
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     # 1. Запуск встроенного веб-сервера для Render и UptimeRobot
     server_thread = threading.Thread(target=run_health_check_server, daemon=True)
