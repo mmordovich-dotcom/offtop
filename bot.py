@@ -1,6 +1,6 @@
 """
 Telegram-бот: в выбранных темах (топиках) форума удаляет любые сообщения,
-в которых нет символа "#" (в тексте или в подписи к медиа).
+в которых нет настоящего хэштега "#слово" (в тексте или в подписи к медиа).
 
 Команды (вызывать ВНУТРИ нужной темы, только для админов чата):
   /require_hashtag    — включить правило для текущей темы
@@ -18,10 +18,11 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from telegram import Update
+from telegram import MessageEntity, Update
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
@@ -42,8 +43,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 
 DATA_FILE = Path(__file__).parent / "topics.json"
 
-# Сообщение считается корректным, только если после "#" сразу идёт слово
+# Резервная проверка: "#" + хотя бы один словесный символ сразу после
 HASHTAG_WITH_WORD_RE = re.compile(r"#\w+", re.UNICODE)
+
+# Символы нулевой ширины и управляющие символы форматирования
+ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u200e\u200f\ufeff\u2060\u061c]")
 
 
 # --- HTTP-сервер для Render и UptimeRobot ---
@@ -71,7 +75,28 @@ def run_health_check_server():
     server.serve_forever()
 
 
-# --- Логика бота ---
+# --- Вспомогательные функции проверки ---
+def normalize_text(raw_text: str) -> str:
+    """Приводит текст к устойчивому виду перед резервной проверкой."""
+    text = unicodedata.normalize("NFKC", raw_text)
+    text = ZERO_WIDTH_RE.sub("", text)
+    return text
+
+
+def has_valid_hashtag(message) -> bool:
+    """Сначала проверяем entities Telegram, затем резервный regex."""
+    entities = (message.entities or []) + (message.caption_entities or [])
+    if any(e.type == MessageEntity.HASHTAG for e in entities):
+        return True
+
+    raw_text = message.text or message.caption or ""
+    if not raw_text:
+        return False
+
+    return bool(HASHTAG_WITH_WORD_RE.search(normalize_text(raw_text)))
+
+
+# --- Хранилище тем ---
 def load_data() -> dict:
     if DATA_FILE.exists():
         try:
@@ -95,6 +120,7 @@ async def is_chat_admin(update: Update) -> bool:
     return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
 
+# --- Команды ---
 async def cmd_require_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message.is_topic_message:
@@ -161,8 +187,13 @@ async def cmd_list_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
+    # Достает сообщение и из update.message, и из update.edited_message
+    message = update.effective_message
     if message is None or not message.is_topic_message:
+        return
+
+    # Свои же служебные ответы бота не трогаем
+    if message.from_user and message.from_user.is_bot and message.from_user.id == context.bot.id:
         return
 
     chat_id = str(update.effective_chat.id)
@@ -173,17 +204,17 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if thread_id not in topics:
         return
 
-    text = message.text or message.caption or ""
-    if HASHTAG_WITH_WORD_RE.search(text):
+    if has_valid_hashtag(message):
         return
 
     try:
         await message.delete()
         logger.info(
-            "Удалено сообщение без #слово в чате %s, теме %s, от пользователя %s",
+            "Удалено сообщение без #слово в чате %s, теме %s, от пользователя %s (edited=%s)",
             chat_id,
             thread_id,
-            update.effective_user.id,
+            update.effective_user.id if update.effective_user else "?",
+            update.edited_message is not None,
         )
     except Exception as e:
         logger.warning("Не удалось удалить сообщение: %s", e)
@@ -192,25 +223,31 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE" or not BOT_TOKEN:
         raise SystemExit(
-            "Укажите токен бота: задайте переменную окружения BOT_TOKEN "
-            "или впишите его в код."
+            "Укажите токен бота: переменная окружения BOT_TOKEN "
+            "или прямое значение в коде bot.py."
         )
 
     # Принудительно создаем и регистрируем event loop для главного потока
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # 1. Запуск встроенного веб-сервера для Render и UptimeRobot
+    # Запуск встроенного веб-сервера для Render и UptimeRobot
     server_thread = threading.Thread(target=run_health_check_server, daemon=True)
     server_thread.start()
 
-    # 2. Запуск бота через Long Polling
+    # Запуск Telegram-бота
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("require_hashtag", cmd_require_hashtag))
     app.add_handler(CommandHandler("unrequire_hashtag", cmd_unrequire_hashtag))
     app.add_handler(CommandHandler("list_topics", cmd_list_topics))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_message))
+
+    # Обработка всех типов новых сообщений
+    content_filter = filters.ALL & ~filters.COMMAND & ~filters.StatusUpdate.ALL
+    app.add_handler(MessageHandler(content_filter, check_message))
+    
+    # Обработка отредактированных сообщений
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & content_filter, check_message))
 
     logger.info("Бот запущен, ожидаю сообщения...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
